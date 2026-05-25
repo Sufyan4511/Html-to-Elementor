@@ -106,7 +106,7 @@ Respond ONLY with a JSON object in this exact format (no markdown fences, no exp
   ]
 }
 
-Valid widgetType values: heading, text-editor, image, button, video, icon, icon-box, image-box, divider, spacer, nav-menu, image-carousel, google_maps, form, html, container
+Valid widgetType values: heading, text-editor, image, button, video, icon, icon-box, image-box, divider, spacer, nav-menu, image-carousel, google_maps, form, html, container, counter, progress-bar, alert, tabs, accordion, toggle, star-rating, testimonial, price-table, call-to-action, social-icons
 
 Only include fixes where you are confident. If nothing needs fixing, return an empty fixes array.`;
 }
