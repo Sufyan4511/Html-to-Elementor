@@ -236,11 +236,39 @@ function parseInlineStyle(raw: string): ParsedStyles {
     const val = decl.slice(colonIdx + 1).trim();
     if (!prop || !val) return;
 
+    // font shorthand
     if (prop === 'font') {
       const lhMatch = val.match(/(\d[\d.]*(?:px|em|rem|%)?)\/(\d[\d.]*(?:px|em|rem|%)?)/);
       if (lhMatch) { styles.fontSize = lhMatch[1]; styles.lineHeight = lhMatch[2]; }
       const weightMatch = val.match(/\b(bold|bolder|lighter|100|200|300|400|500|600|700|800|900)\b/);
       if (weightMatch) styles.fontWeight = weightMatch[1];
+      return;
+    }
+
+    // background shorthand: extract color if it's not an image/gradient
+    if (prop === 'background') {
+      if (!val.includes('url(') && !val.includes('gradient(') && !val.includes('linear-') && !val.includes('radial-')) {
+        // Could be a bare color value like "#111" or "rgba(...)" or "white"
+        const colorMatch = val.match(/^(#[\da-fA-F]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\)|\w+)$/);
+        if (colorMatch) { styles.backgroundColor = colorMatch[1]; return; }
+        // Multi-value: pick the color token
+        const tokens = val.trim().split(/\s+/);
+        const colorToken = tokens.find(t => /^(#[\da-fA-F]{3,8}|rgba?\(|hsla?\(|transparent|white|black|red|blue|green|grey|gray)/.test(t));
+        if (colorToken) styles.backgroundColor = colorToken;
+      } else if (val.includes('url(')) {
+        styles.backgroundImage = val;
+      }
+      return;
+    }
+
+    // border shorthand: extract color, width, style
+    if (prop === 'border') {
+      const wM = val.match(/(\d+(?:\.\d+)?(?:px|em|rem))/);
+      if (wM) styles.borderWidth = wM[1];
+      const styleM = val.match(/\b(solid|dashed|dotted|double|none)\b/);
+      if (styleM) styles.borderStyle = styleM[1];
+      const colorM = val.match(/(#[\da-fA-F]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\)|transparent)/);
+      if (colorM) styles.borderColor = colorM[1];
       return;
     }
 
@@ -388,15 +416,17 @@ function buildStyleMap(doc: Document): StyleMapResult {
   doc.querySelectorAll('style').forEach(styleEl => {
     const text = styleEl.textContent || '';
     allRawCss += text + '\n';
-    const flatRuleRegex = /^([^@{][^{]*)\{([^{}]*)\}/gm;
-    let m: RegExpExecArray | null;
-    while ((m = flatRuleRegex.exec(text)) !== null) {
-      const declarations = parseInlineStyle(m[2]);
-      m[1].split(',').map(s => s.trim()).filter(Boolean).forEach(sel => rules.push({ selector: sel, declarations }));
-    }
   });
 
+  // Parse all CSS blocks once — reuse for both computed styles and custom_css
   const allBlocks = parseCssBlocks(allRawCss);
+
+  // Build flat rules from non-@-rule blocks for computed style merging
+  for (const block of allBlocks) {
+    if (block.isAtRule) continue;
+    const declarations = parseInlineStyle(block.body);
+    block.selector.split(',').map(s => s.trim()).filter(Boolean).forEach(sel => rules.push({ selector: sel, declarations }));
+  }
 
   doc.body.querySelectorAll('*').forEach(el => {
     const merged: ParsedStyles = {};
@@ -474,11 +504,24 @@ function parseSpacingShorthand(val: string): Record<string, unknown> | null {
   const parsed = parts.map(p => parseSize(p));
   if (parsed.some(p => p === null)) return null;
   const ps = parsed as Array<{ size: number; unit: string }>;
-  const unit = ps.find(p => p.size !== 0)?.unit || ps[0]?.unit || 'px';
-  if (ps.length === 1) return spacing(String(ps[0].size), String(ps[0].size), String(ps[0].size), String(ps[0].size), unit, true);
-  if (ps.length === 2) return spacing(String(ps[0].size), String(ps[1].size), String(ps[0].size), String(ps[1].size), unit, false);
-  if (ps.length === 3) return spacing(String(ps[0].size), String(ps[1].size), String(ps[2].size), String(ps[1].size), unit, false);
-  if (ps.length === 4) return spacing(String(ps[0].size), String(ps[1].size), String(ps[2].size), String(ps[3].size), unit, false);
+
+  // Determine the dominant unit (first non-zero, or first overall)
+  // If units are mixed (e.g. px + %), use px for the Elementor object —
+  // percentage sides will be rounded to their pixel-equivalent value but
+  // the raw shorthand is still in custom_css for the browser to use correctly.
+  const unit = ps.find(p => p.size !== 0 && p.unit === 'px')?.unit
+    || ps.find(p => p.size !== 0)?.unit
+    || ps[0]?.unit
+    || 'px';
+
+  // Normalize each side: if unit matches keep as-is, otherwise keep size as-is
+  // (Elementor treats the number as the value in the chosen unit)
+  function side(s: { size: number; unit: string }): string { return String(s.size); }
+
+  if (ps.length === 1) return spacing(side(ps[0]), side(ps[0]), side(ps[0]), side(ps[0]), unit, true);
+  if (ps.length === 2) return spacing(side(ps[0]), side(ps[1]), side(ps[0]), side(ps[1]), unit, false);
+  if (ps.length === 3) return spacing(side(ps[0]), side(ps[1]), side(ps[2]), side(ps[1]), unit, false);
+  if (ps.length === 4) return spacing(side(ps[0]), side(ps[1]), side(ps[2]), side(ps[3]), unit, false);
   return null;
 }
 
@@ -715,29 +758,37 @@ function detectSocialHref(href: string): string | null {
 
 interface IconInfo { value: string; library: 'fa-solid' | 'fa-regular' | 'fa-brands' | 'fa-light' | 'eicons' | 'svg' }
 
+// Library specifier tokens that are NOT icon names — skip these when looking for the icon slug
+const FA_LIBRARY_TOKENS = new Set(['solid', 'regular', 'light', 'thin', 'duotone', 'brands', 'sharp']);
+
+function extractFaIconName(cls: string): string | null {
+  // Find all fa-SLUG tokens, filter out library specifiers (fa-solid, fa-regular, etc.)
+  const matches = Array.from(cls.matchAll(/\bfa-([\w-]+)\b/g));
+  const iconSlug = matches.map(m => m[1]).find(slug => !FA_LIBRARY_TOKENS.has(slug));
+  return iconSlug || null;
+}
+
 function extractIconFromEl(el: Element): IconInfo | null {
   const cls = el.getAttribute('class') || '';
 
   const eiM = cls.match(/\beicon-([\w-]+)\b/);
   if (eiM) return { value: `eicon-${eiM[1]}`, library: 'eicons' };
 
-  if (/\bfab\b/.test(cls)) {
-    const m = cls.match(/\bfa-([\w-]+)\b/); if (m) return { value: `fab fa-${m[1]}`, library: 'fa-brands' };
-  }
-  if (/\bfal\b/.test(cls)) {
-    const m = cls.match(/\bfa-([\w-]+)\b/); if (m) return { value: `fal fa-${m[1]}`, library: 'fa-light' };
-  }
-  if (/\bfar\b/.test(cls)) {
-    const m = cls.match(/\bfa-([\w-]+)\b/); if (m) return { value: `far fa-${m[1]}`, library: 'fa-regular' };
-  }
-  if (/\b(fas?|fa-)\b/.test(cls)) {
-    const m = cls.match(/\bfa-([\w-]+)\b/); if (m) return { value: `fas fa-${m[1]}`, library: 'fa-solid' };
-  }
+  // Determine library first, then extract icon name separately
+  const iconName = extractFaIconName(cls);
+  if (!iconName) return null;
 
-  const glM = cls.match(/\bglyphicon-?([\w-]+)\b/);
-  if (glM) return { value: `fas fa-${glM[1]}`, library: 'fa-solid' };
-
-  return null;
+  if (/\bfab\b/.test(cls) || /\bfa-brands\b/.test(cls)) {
+    return { value: `fab fa-${iconName}`, library: 'fa-brands' };
+  }
+  if (/\bfal\b/.test(cls) || /\bfa-light\b/.test(cls)) {
+    return { value: `fal fa-${iconName}`, library: 'fa-light' };
+  }
+  if (/\bfar\b/.test(cls) || /\bfa-regular\b/.test(cls)) {
+    return { value: `far fa-${iconName}`, library: 'fa-regular' };
+  }
+  // Default to solid (fas, fa-solid, or bare fa-ICON)
+  return { value: `fas fa-${iconName}`, library: 'fa-solid' };
 }
 
 function extractButtonIconAndText(el: Element): { text: string; icon: IconInfo | null; svgHtml: string | null } {
@@ -761,7 +812,9 @@ function extractButtonIconAndText(el: Element): { text: string; icon: IconInfo |
 }
 
 function hasIconClass(el: Element): boolean {
-  return /fa-|fa |icon|glyphicon|material-icons/.test(el.className || '');
+  const cls = el.getAttribute('class') || '';
+  // Match Font Awesome v5/v6 (fa-solid, fas, fab, far, fal, fa-ICON, eicons, glyphicons, material-icons)
+  return /\b(fa-solid|fa-regular|fa-brands|fa-light|fas|fab|far|fal|fa-\w|eicon-|glyphicon|material-icons?)\b/.test(cls);
 }
 
 function isEmptySpacingDiv(el: Element): boolean {
